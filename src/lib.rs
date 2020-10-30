@@ -1,12 +1,12 @@
 
 
 use std::collections::HashMap;
-use std::sync::{RwLock, Mutex};
+use std::sync::{RwLock, Mutex, Arc};
 use lazy_static::lazy_static;
 use std::time::{ Instant, SystemTime };
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub struct Rollup {
+struct Rollup {
     pub total: u32,
     pub sample_count: u32,
     pub start_ticks: std::time::Instant,
@@ -17,7 +17,7 @@ pub struct Rollup {
 }
 
 impl Rollup {
-    pub fn reset_rollup(&mut self) {
+    fn reset_rollup(&mut self) {
         self.total = 0;
         self.sample_count = 0;
         self.start_ticks = Instant::now();
@@ -27,12 +27,12 @@ impl Rollup {
         self.whole = false;
     }
 
-    pub fn add_value(&mut self, value: u32) {
+    fn add_value(&mut self, value: u32) {
         self.sample_count = self.sample_count + 1;
         self.total += value;
     }
 
-    pub fn new() -> Rollup {
+    fn new() -> Rollup {
         Rollup { 
             total: 0,
             sample_count: 0,
@@ -50,7 +50,7 @@ impl Rollup {
 
 }
 
-pub struct Rollups {
+struct Rollups {
     current_rollup_index: usize,
     interval_seconds: u32,
     pub rollups: Vec<Rollup>,
@@ -83,7 +83,10 @@ impl Rollups {
             result = self.rollups.get_mut(self.current_rollup_index);
 
             match result {
-                Some(rollup_result) => rollup = rollup_result,
+                Some(rollup_result) => {
+                    rollup = rollup_result;
+                    rollup.reset_rollup();
+                }
                 None => panic!("no rollup at index {}", self.current_rollup_index)
             }
         }            
@@ -106,8 +109,8 @@ impl Rollups {
     }
 }
 
-pub struct RollupIntervals {
-    pub rollup_intervals: Vec<Rollups>,
+struct RollupIntervals {
+    rollup_intervals: Vec<Rollups>,
 }
 
 impl RollupIntervals {
@@ -137,21 +140,21 @@ impl RollupIntervals {
     }
 }
 
-pub struct MeasureInner {
-    pub intervals: RollupIntervals,
-    pub name: String
+struct MeasureInner {
+    intervals: RollupIntervals,
+    name: String
 }
 
 impl MeasureInner {
-    pub fn new(name: &String) -> MeasureInner {
+    fn new(name: &String) -> MeasureInner {
         MeasureInner { name: name.clone(), intervals: RollupIntervals::new() }
     }
 
-    pub fn add_value(&mut self, value: u32) {
+    fn add_value(&mut self, value: u32) {
         self.intervals.add_value(value);
     }
 
-    pub fn debug_out_measures(&self) {
+    fn debug_out_measures(&self) {
         println!("Measure Named: {} ", self.name);
         self.intervals.debug_out_measures();
     }
@@ -162,38 +165,40 @@ pub struct Measure {
 }
 
 impl Measure {
-    pub fn new(name: &String) -> Measure {
+    fn new(name: &String) -> Measure {
         Measure { inner: Mutex::new(MeasureInner::new(name))}
     }
 
-    pub fn add_value(&mut self, value: u32) {
+    fn add_value(&self, value: u32) {
         self.inner.lock().unwrap().add_value(value);
     }
 
-    pub fn debug_out_measures(&self) {
+    fn debug_out_measures(&self) {
         self.inner.lock().unwrap().debug_out_measures();
     }
 }
+
+unsafe impl Sync for Measure {}
 
 pub type MeasureHandle = usize;
 static NEXT_MEASURE_HANDLE: AtomicUsize = AtomicUsize::new(1);
 
 
-pub struct MeasuresInner {
-    pub measures: HashMap<MeasureHandle, Measure>,
-    pub measures_by_name: HashMap<String, MeasureHandle>,
+struct MeasuresInner {
+    measures: HashMap<MeasureHandle, Arc<Measure>>,
+    measures_by_name: HashMap<String, MeasureHandle>,
 }
 
 impl MeasuresInner {
-    pub fn new() -> MeasuresInner {
+    fn new() -> MeasuresInner {
         MeasuresInner { measures: HashMap::new(), measures_by_name: HashMap::new() }
     }
 
-    pub fn new_measure(&mut self, name: &String) -> MeasureHandle {
+    fn new_measure(&mut self, name: &String) -> MeasureHandle {
         if !self.measures_by_name.contains_key(name) {
             let handle = NEXT_MEASURE_HANDLE.fetch_add(1, Ordering::SeqCst);
             self.measures_by_name.insert(name.clone(), handle);
-            self.measures.insert(handle, Measure::new(name));
+            self.measures.insert(handle, Arc::new(Measure::new(name)));
         }
         match self.measures_by_name.get(name) {
             Some(handle) => *handle,
@@ -201,14 +206,14 @@ impl MeasuresInner {
         }
     }
 
-    pub fn exists(&self, name: &String) -> bool {
+    fn exists(&self, name: &String) -> bool {
         self.measures_by_name.contains_key(name)
     }
-    pub fn get_handle(&self, name: &String) -> MeasureHandle {
+    fn get_handle(&self, name: &String) -> MeasureHandle {
         self.measures_by_name[name]
     }
 
-    pub fn add_value(&mut self, handle: MeasureHandle, value: u32) {
+    fn add_value(&mut self, handle: MeasureHandle, value: u32) {
         match self.measures.get_mut(&handle) {
             Some(measure) => measure.add_value(value),
             None => {
@@ -222,7 +227,7 @@ impl MeasuresInner {
         }
     }
 
-    pub fn add_value_by_name(&mut self, name: String, value: u32) {
+    fn add_value_by_name(&mut self, name: String, value: u32) {
         let measure_handle;
         {
             match self.measures_by_name.get(&name) {
@@ -242,7 +247,7 @@ impl MeasuresInner {
         self.add_value(measure_handle, value);
     }
 
-    pub fn debug_out_measures(&self) {
+    fn debug_out_measures(&self) {
         println!("debug_out_measures called");
         for (_, measure) in &self.measures {
             measure.debug_out_measures();
@@ -282,6 +287,14 @@ impl Measures {
         measures_inner.add_value(handle, value);
     }
 
+    pub fn get_measure(&self, handle: MeasureHandle) -> Option<Arc<Measure>> {
+        let measures_inner = self.inner.write().unwrap();
+        match measures_inner.measures.get(&handle) {
+            Some(result) => Some(result.clone()),
+            None => Option::None
+        }
+    }
+ 
     pub fn add_value_by_name(&self, name: String, value: u32) {
         let mut measures_inner = self.inner.write().unwrap();
         measures_inner.add_value_by_name(name, value);
@@ -398,7 +411,12 @@ mod tests {
         }
 
         for i in 0..handles.len() {
-            MEASURES.add_value(handles[i], 32);
+            match MEASURES.get_measure(handles[i]) {
+                Some(measure) => measure.add_value(32),
+                None => panic!("Measure should have been found by handle, something seriously wrong with code or test!")
+            }
+
+            
         }
     }
     fn test_thread2() {
